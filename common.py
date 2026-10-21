@@ -1,3 +1,9 @@
+import ipaddress
+import random
+import logging
+import time
+from pathlib import Path
+
 SENSOR_SPECS = {
     "ThermoNode": {
         "temperature": {
@@ -109,3 +115,55 @@ def validate_sensor_data(sensor_type: str, data: dict) -> bool:
             raise ValueError("Sensor value not in accepted range")
 
     return True
+
+def generate_sensor_data(sensor_type: str):
+    if not sensor_type in SENSOR_SPECS.keys():
+        raise ValueError("Invalid sensor_type")
+
+    data = {}
+
+    sensor_type_format = SENSOR_SPECS[sensor_type]
+
+    for key, value in sensor_type_format.items():
+        min_value, max_value, decimals = value.values()
+        data[key] = round(random.uniform(min_value, max_value), decimals) if decimals != 0 else random.randint(min_value, max_value)
+
+    validate_sensor_data(sensor_type, data)
+    return data
+
+def validate_ip(ip: str) -> bool:
+    if not isinstance(ip, str):
+        raise ValueError("IP is not str")
+
+    ipaddress.IPv4Address(ip)
+    return True
+
+def validate_port(port: int) -> bool:
+    if type(port) is not int:
+        raise ValueError("Port is not int")
+
+    if not 1 <= port <= 65535:
+        raise ValueError("Port must be between 1 and 65535")
+
+    return True
+
+def log_event(source: str, message: str, log_type: str = "SYSTEM", level: int = logging.INFO):
+    program = source.split(":")[0]
+    logger = logging.getLogger(f"PKS.{program}")
+
+    if not logger.handlers:
+        log_directory = Path(__file__).parent / "logs"
+        log_directory.mkdir(exist_ok=True)
+        log_file = log_directory / f"{program.lower()}.log"
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+        formatter = logging.Formatter(
+            "%(asctime)s.%(msecs)03dZ | %(log_type)s | %(levelname)s | %(source)s | %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S"
+        )
+        formatter.converter = time.gmtime
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+    logger.log(level, message, extra={"log_type": log_type, "source": source})
