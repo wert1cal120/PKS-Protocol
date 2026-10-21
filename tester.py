@@ -1,6 +1,7 @@
 import socket
 
-from protocol import REGISTER, encode_message, decode_message, REGISTER_ACK, TOKEN_MIN, TOKEN_MAX
+from protocol import REGISTER, encode_message, decode_message, REGISTER_ACK, TOKEN_MIN, TOKEN_MAX, ACK, DATA
+
 
 #TODO REJECT ANSWER HANDLER
 def main():
@@ -11,6 +12,13 @@ def main():
         "sensor_type": "ThermoNode",
         "sensor_id": "T-01",
         "message_id": 1,
+    }
+
+    data = {
+        "temperature": 21.3,
+        "humidity": 55.4,
+        "dew_point": 12.0,
+        "pressure": 1013.25,
     }
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tester_socket:
@@ -51,6 +59,47 @@ def main():
 
         token = answer["token"]
         print(f"Tester successfully registered with token: {token}")
+
+        data_message = {
+            "type": DATA,
+            "sensor_id": message["sensor_id"],
+            "message_id": 2,
+            "token": token,
+            "data": data,
+        }
+
+        try:
+            raw_data = encode_message(data_message)
+            tester_socket.sendto(raw_data, server_address)
+            print("Data was sent")
+
+            raw_answer, sender_address = tester_socket.recvfrom(65535)
+
+            if sender_address != server_address:
+                raise ValueError("Invalid server address")
+
+            answer = decode_message(raw_answer)
+            print(answer)
+            if answer["type"] != ACK:
+                raise ValueError("Invalid answer for ACK")
+
+            if answer["message_id"] != data_message["message_id"]:
+                raise ValueError("Invalid message id")
+
+            if answer["token"] != token:
+                raise ValueError("Invalid token")
+
+        except socket.timeout:
+            print("Registration timed out: no response within 3 seconds")
+            return
+
+        except ValueError as error:
+            print(f"Invalid data from {sender_address}: {error}")
+            return
+
+        except OSError as error:
+            print(f"Socket error: {error}")
+            return
 
 if __name__ == "__main__":
     main()

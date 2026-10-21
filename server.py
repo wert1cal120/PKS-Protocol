@@ -1,7 +1,7 @@
 import random
 import socket
 
-from common import SENSOR_SPECS
+from common import SENSOR_SPECS, validate_sensor_data
 from protocol import REGISTER, REGISTER_ACK, DATA, ACK, decode_message, encode_message, TOKEN_MIN, TOKEN_MAX
 
 
@@ -72,11 +72,25 @@ def handle_register_ack(message_id: int, token: int):
     }
     return message
 
-def handle_data():
-    pass
+def handle_data(message: dict, sessions: dict, sender_address: tuple):
+    if sessions.get(message["sensor_id"]) is None:
+        raise ValueError("Session with this sensor does not exist")
 
-def handle_ack():
-    pass
+    session = sessions[message["sensor_id"]]
+    if session["token"] != message["token"]:
+        raise ValueError("Invalid token for current session")
+
+    validate_sensor_data(session["sensor_type"], message["data"])
+    print(message["data"])
+    return handle_ack(message["message_id"], message["token"])
+
+def handle_ack(message_id: int, token: int):
+    message = {
+        "type": ACK,
+        "message_id": message_id,
+        "token": token
+    }
+    return message
 
 handlers = {
     REGISTER: handle_register,
