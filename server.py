@@ -2,45 +2,70 @@ import json
 import logging
 import random
 import socket
+import threading
 
 from common import SENSOR_SPECS, validate_sensor_data, validate_ip, validate_port, log_event
 from protocol import REGISTER, REGISTER_ACK, DATA, ACK, decode_message, encode_message, TOKEN_MIN, TOKEN_MAX
 
 
-def main(host: str, port: int):
-
+def run_server(server_socket, stop_event):
     sessions = {}
 
+    while not stop_event.is_set():
+        try:
+            raw_data, sender_address = server_socket.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError as error:
+            log_event("SERVER", f"Socket error: {error}", level=logging.ERROR)
+            stop_event.set()
+            return
+
+        try:
+            message = decode_message(raw_data)
+        except ValueError as error:
+            log_event("SERVER", f"Invalid data from {sender_address}: {error}; raw={raw_data!r}", level=logging.ERROR)
+            continue
+
+        log_event("SERVER", f"Received from {sender_address}: {json.dumps(message)}", "MESSAGE")
+        try:
+            if handlers.get(message["type"]) is None:
+                raise ValueError("Invalid request type")
+
+            answer = handlers[message["type"]](message, sessions, sender_address)
+            encoded_answer = encode_message(answer)
+            server_socket.sendto(encoded_answer, sender_address)
+            log_event("SERVER", f"Sent to {sender_address}: {json.dumps(answer)}", "MESSAGE")
+        except (ValueError, OSError) as error:
+            log_event("SERVER", f"Cannot process message from {sender_address}: {error}", level=logging.ERROR)
+
+
+def main(host: str, port: int):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
         server_socket.bind((host, port))
+        server_socket.settimeout(0.2)
         log_event("SERVER", f"Server listening on {host}:{port}")
 
-        while True:
-            raw_data, sender_address = server_socket.recvfrom(65535)
+        stop_event = threading.Event()
+        receiver = threading.Thread(target=run_server, args=(server_socket, stop_event))
+        receiver.start()
 
-            try:
-                message = decode_message(raw_data)
-            except ValueError as error:
-                log_event("SERVER", f"Invalid data from {sender_address}: {error}; raw={raw_data!r}", level=logging.ERROR)
-                continue
+        try:
+            while not stop_event.is_set():
+                print(f"SERVER - listening on {host}:{port}")
+                print("0. Stop listening and return to settings")
+                op = input(": ").strip()
 
-            log_event("SERVER", f"Received from {sender_address}: {json.dumps(message)}", "MESSAGE")
+                if op == "0":
+                    break
 
-            try:
-                if handlers.get(message["type"]) is None:
-                    raise ValueError("Invalid request type")
-
-                #TODO FIX ARGUMENTS CONFLICTS IN DIFFERENT HANDLERS
-                answer = handlers[message["type"]](message, sessions, sender_address)
-                encoded_answer = encode_message(answer)
-
-                server_socket.sendto(encoded_answer, sender_address)
-                log_event("SERVER", f"Sent to {sender_address}: {json.dumps(answer)}", "MESSAGE")
-            except ValueError as error:
-                log_event("SERVER", f"Rejected message from {sender_address}: {error}", level=logging.ERROR)
-                continue
-
-
+                print("Invalid option")
+        except (KeyboardInterrupt, EOFError):
+            pass
+        finally:
+            stop_event.set()
+            receiver.join()
+            log_event("SERVER", "Server stopped")
 
 
 def handle_register(message: dict, sessions: dict, sender_address: tuple):
@@ -66,6 +91,7 @@ def handle_register(message: dict, sessions: dict, sender_address: tuple):
     log_event("SERVER", f"Sensor registered: {message['sensor_type']}:{message['sensor_id']}")
     return handle_register_ack(message["message_id"], sensor_token)
 
+
 def handle_register_ack(message_id: int, token: int):
     message = {
         "type": REGISTER_ACK,
@@ -73,6 +99,7 @@ def handle_register_ack(message_id: int, token: int):
         "token": token
     }
     return message
+
 
 def handle_data(message: dict, sessions: dict, sender_address: tuple):
     if sessions.get(message["sensor_id"]) is None:
@@ -85,6 +112,7 @@ def handle_data(message: dict, sessions: dict, sender_address: tuple):
     validate_sensor_data(session["sensor_type"], message["data"])
     return handle_ack(message["message_id"], message["token"])
 
+
 def handle_ack(message_id: int, token: int):
     message = {
         "type": ACK,
@@ -93,10 +121,12 @@ def handle_ack(message_id: int, token: int):
     }
     return message
 
+
 handlers = {
     REGISTER: handle_register,
     DATA: handle_data,
 }
+
 
 if __name__ == "__main__":
     log_event("SERVER", "Server program started")
