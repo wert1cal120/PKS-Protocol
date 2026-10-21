@@ -1,9 +1,11 @@
 import json
+import zlib
 
 REGISTER = "REGISTER"
 REGISTER_ACK = "REGISTER_ACK"
 DATA = "DATA"
 ACK = "ACK"
+RESEND = "RESEND"
 
 
 MESSAGE_FORMATS ={
@@ -23,6 +25,12 @@ MESSAGE_FORMATS ={
         "sensor_id": str,
         "message_id": int,
         "data": dict,
+        "token": int,
+        "checksum": int
+    },
+    RESEND: {
+        "type": str,
+        "message_id": int,
         "token": int
     },
     ACK: {
@@ -72,3 +80,11 @@ def validate_message(message: dict) -> bool:
             raise ValueError("Invalid value type")
 
     return True
+
+
+def calculate_checksum(message: dict) -> int:
+    content = message.copy()
+    content.pop("checksum", None)
+
+    json_text = json.dumps(content, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return zlib.crc32(json_text.encode("utf-8"))

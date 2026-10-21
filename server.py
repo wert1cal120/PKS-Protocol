@@ -5,7 +5,7 @@ import socket
 import threading
 
 from common import SENSOR_SPECS, validate_sensor_data, validate_ip, validate_port, log_event
-from protocol import REGISTER, REGISTER_ACK, DATA, ACK, decode_message, encode_message, TOKEN_MIN, TOKEN_MAX
+from protocol import REGISTER, REGISTER_ACK, DATA, ACK, decode_message, encode_message, TOKEN_MIN, TOKEN_MAX, RESEND, calculate_checksum
 
 
 def run_server(server_socket, stop_event):
@@ -109,7 +109,24 @@ def handle_data(message: dict, sessions: dict, sender_address: tuple):
     if session["token"] != message["token"]:
         raise ValueError("Invalid token for current session")
 
+    sensor_name = f"{session['sensor_type']}:{message['sensor_id']}"
+
+    if message["checksum"] != calculate_checksum(message):
+        log_event(
+            "SERVER",
+            f"Integrity check failed for {sensor_name}, message {message['message_id']}; retransmission requested",
+            level=logging.WARNING
+        )
+
+        return {
+            "type": RESEND,
+            "message_id": message["message_id"],
+            "token": message["token"]
+        }
+
     validate_sensor_data(session["sensor_type"], message["data"])
+    log_event("SERVER", f"Measurement accepted: {sensor_name} {json.dumps(message['data'])}")
+
     return handle_ack(message["message_id"], message["token"])
 
 

@@ -6,7 +6,7 @@ import threading
 from queue import Queue, Empty
 
 from common import generate_sensor_data, SENSOR_SPECS, validate_ip, validate_port, log_event, validate_sensor_data
-from protocol import REGISTER, encode_message, decode_message, REGISTER_ACK, TOKEN_MIN, TOKEN_MAX, ACK, DATA
+from protocol import REGISTER, encode_message, decode_message, REGISTER_ACK, TOKEN_MIN, TOKEN_MAX, ACK, DATA, RESEND, calculate_checksum
 
 
 def register_sensor(sock, server_address, sensor_type, sensor_id, message_id):
@@ -43,7 +43,7 @@ def register_sensor(sock, server_address, sensor_type, sensor_id, message_id):
     return answer["token"]
 
 
-def send_measurement(sock, server_address, sensor_id, token, message_id, data, sensor_type):
+def send_measurement(sock, server_address, sensor_id, token, message_id, data, sensor_type, corrupt=False):
     source = f"TESTER:{sensor_type}:{sensor_id}"
 
     data_message = {
@@ -51,29 +51,52 @@ def send_measurement(sock, server_address, sensor_id, token, message_id, data, s
         "sensor_id": sensor_id,
         "message_id": message_id,
         "token": token,
-        "data": data,
+        "data": data.copy(),
     }
+    data_message["checksum"] = calculate_checksum(data_message)
 
-    raw_data = encode_message(data_message)
-    sock.sendto(raw_data, server_address)
-    log_event(source, f"Sent to {server_address}: {json.dumps(data_message)}", "MESSAGE")
+    message_to_send = data_message
 
-    raw_answer, sender_address = sock.recvfrom(65535)
+    if corrupt:
+        message_to_send = data_message.copy()
+        message_to_send["data"] = data.copy()
 
-    answer = decode_message(raw_answer)
-    log_event(source, f"Received from {sender_address}: {json.dumps(answer)}", "MESSAGE")
+        parameter = next(iter(data))
+        spec = SENSOR_SPECS[sensor_type][parameter]
+        damaged_value = spec["min"] if data[parameter] != spec["min"] else spec["max"]
+        message_to_send["data"][parameter] = damaged_value
 
-    if sender_address != server_address:
-        raise ValueError("Invalid server address")
+        log_event(source, f"Corrupting next DATA message: {message_id}", level=logging.WARNING)
 
-    if answer["type"] != ACK:
-        raise ValueError("Invalid answer for ACK")
+    for attempt in range(3):
+        raw_data = encode_message(message_to_send)
+        sock.sendto(raw_data, server_address)
+        log_event(source, f"Sent to {server_address}: {json.dumps(message_to_send)}", "MESSAGE")
 
-    if answer["message_id"] != data_message["message_id"]:
-        raise ValueError("Invalid message id")
+        raw_answer, sender_address = sock.recvfrom(65535)
+        answer = decode_message(raw_answer)
+        log_event(source, f"Received from {sender_address}: {json.dumps(answer)}", "MESSAGE")
 
-    if answer["token"] != token:
-        raise ValueError("Invalid token")
+        if sender_address != server_address:
+            raise ValueError("Invalid server address")
+
+        if answer["type"] not in (ACK, RESEND):
+            raise ValueError("Expected ACK or RESEND")
+
+        if answer["message_id"] != message_id:
+            raise ValueError("Invalid message id")
+
+        if answer["token"] != token:
+            raise ValueError("Invalid token")
+
+        if answer["type"] == ACK:
+            return
+
+        if attempt < 2:
+            log_event(source, f"Resending original DATA message: {message_id}")
+            message_to_send = data_message
+
+    raise ValueError("Server still rejects the measurement after 3 attempts")
 
 
 def input_sensor_data(sensor_type: str):
@@ -112,7 +135,16 @@ def run_sender(sock, server_address, sessions, message_id, commands, stop_event)
         pending = []
 
         try:
-            pending.append(commands.get_nowait())
+            action, session, data, result = commands.get_nowait()
+
+            if action == "corrupt":
+                session["corrupt_next"] = True
+                source = f"TESTER:{session['sensor_type']}:{session['sensor_id']}"
+                log_event(source, "Corruption enabled for the next DATA message")
+                result.put(None)
+            else:
+                pending.append((session, data, result))
+
         except Empty:
             pass
 
@@ -132,11 +164,13 @@ def run_sender(sock, server_address, sessions, message_id, commands, stop_event)
             current_id = message_id
             message_id += 1
             error_message = None
+            corrupt = session["corrupt_next"]
+            session["corrupt_next"] = False
 
             try:
                 send_measurement(
                     sock, server_address, session["sensor_id"], session["token"],
-                    current_id, data, session["sensor_type"]
+                    current_id, data, session["sensor_type"], corrupt
                 )
             except (ValueError, OSError) as error:
                 error_message = f"Measurement was not confirmed: {error}"
@@ -152,11 +186,12 @@ def tester_menu(sessions, commands, stop_event):
     while not stop_event.is_set():
         print("TESTER - automatic sending is active")
         print("1. Send custom measurement")
+        print("2. Corrupt next measurement")
         print("0. Exit")
         op = input(": ").strip()
 
         match op:
-            case "1":
+            case "1" | "2":
                 for i, session in enumerate(sessions):
                     print(f"{i + 1}. {session['sensor_type']} ({session['sensor_id']})")
 
@@ -174,22 +209,30 @@ def tester_menu(sessions, commands, stop_event):
                     continue
 
                 session = sessions[choice - 1]
-                data = input_sensor_data(session["sensor_type"])
+                data = None
+                action = "corrupt"
 
-                if data is None:
-                    continue
+                if op == "1":
+                    data = input_sensor_data(session["sensor_type"])
+
+                    if data is None:
+                        continue
+
+                    action = "send"
 
                 result = Queue()
-                commands.put((session, data, result))
+                commands.put((action, session, data, result))
 
                 while not stop_event.is_set():
                     try:
                         error_message = result.get(timeout=0.2)
 
-                        if error_message is None:
-                            print("Custom measurement confirmed by server")
-                        else:
+                        if error_message is not None:
                             print(error_message)
+                        elif action == "corrupt":
+                            print(f"Next measurement for {session['sensor_id']} will be corrupted")
+                        else:
+                            print("Custom measurement confirmed by server")
 
                         break
                     except Empty:
@@ -232,6 +275,7 @@ def main(server_address: tuple, sensors: list):
                 message_id += 1
 
                 session["auto_send"] = True
+                session["corrupt_next"] = False
                 session["next_send_at"] = time.monotonic() + 10
 
                 log_event(source, "Sensor registered; automatic sending enabled")
