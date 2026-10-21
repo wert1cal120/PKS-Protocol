@@ -32,6 +32,9 @@ MESSAGE_FORMATS ={
     }
 }
 
+TOKEN_MIN = 1
+TOKEN_MAX = 65535  # 2**16 - 1
+
 def encode_message(message: dict) -> bytes:
     validate_message(message)
     json_text = json.dumps(message)
