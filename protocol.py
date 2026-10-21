@@ -6,9 +6,12 @@ REGISTER_ACK = "REGISTER_ACK"
 DATA = "DATA"
 ACK = "ACK"
 RESEND = "RESEND"
+KEEPALIVE = "KEEPALIVE"
+KEEPALIVE_ACK = "KEEPALIVE_ACK"
+REJECT = "REJECT"
 
 
-MESSAGE_FORMATS ={
+MESSAGE_FORMATS = {
     REGISTER: {
         "type": str,
         "sensor_type": str,
@@ -28,6 +31,23 @@ MESSAGE_FORMATS ={
         "token": int,
         "checksum": int
     },
+    KEEPALIVE: {
+        "type": str,
+        "sensor_id": str,
+        "message_id": int,
+        "token": int
+    },
+    KEEPALIVE_ACK: {
+        "type": str,
+        "sensor_id": str,
+        "message_id": int,
+        "token": int
+    },
+    REJECT: {
+        "type": str,
+        "message_id": int,
+        "reason": str
+    },
     RESEND: {
         "type": str,
         "message_id": int,
@@ -40,17 +60,27 @@ MESSAGE_FORMATS ={
     }
 }
 
+AUTO_SEND_INTERVAL = 10
+IDLE_TIMEOUT = 15
+KEEPALIVE_INTERVAL = 5
+SESSION_TIMEOUT = 30
+REPLY_TIMEOUT = 3
+
 TOKEN_MIN = 1
 TOKEN_MAX = 65535  # 2**16 - 1
 
+
 def encode_message(message: dict) -> bytes:
     validate_message(message)
-    json_text = json.dumps(message)
+    json_text = json.dumps(message, allow_nan=False)
     return json_text.encode('utf-8')
 
+
 def decode_message(message: bytes) -> dict:
-    json_text = message.decode('utf-8')
-    json_text = json.loads(json_text)
+    try:
+        json_text = json.loads(message.decode('utf-8'))
+    except RecursionError as error:
+        raise ValueError("Message is nested too deeply") from error
 
     if not isinstance(json_text, dict):
         raise ValueError("Decoded message is not a dictionary")
@@ -58,7 +88,11 @@ def decode_message(message: bytes) -> dict:
     validate_message(json_text)
     return json_text
 
+
 def validate_message(message: dict) -> bool:
+    if not isinstance(message, dict):
+        raise ValueError("Message must be a dictionary")
+
     if "type" not in message:
         raise ValueError("Message does not contain 'type' field")
 
@@ -78,6 +112,20 @@ def validate_message(message: dict) -> bool:
     for key, value in message.items():
         if type(value) is not expected_format[key]:
             raise ValueError("Invalid value type")
+
+    if message["message_id"] < 1:
+        raise ValueError("Message id must be positive")
+
+    if "sensor_id" in message:
+        sensor_id = message["sensor_id"]
+        if not sensor_id.strip() or not sensor_id.isprintable():
+            raise ValueError("Sensor id must be nonempty printable text")
+
+    if "token" in message and not TOKEN_MIN <= message["token"] <= TOKEN_MAX:
+        raise ValueError("Token is outside the allowed range")
+
+    if "checksum" in message and not 0 <= message["checksum"] <= 0xFFFFFFFF:
+        raise ValueError("Checksum must be an unsigned 32-bit integer")
 
     return True
 

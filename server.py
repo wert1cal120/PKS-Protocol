@@ -3,23 +3,75 @@ import logging
 import random
 import socket
 import threading
+import time
 
-from common import SENSOR_SPECS, validate_sensor_data, validate_ip, validate_port, log_event
-from protocol import REGISTER, REGISTER_ACK, DATA, ACK, decode_message, encode_message, TOKEN_MIN, TOKEN_MAX, RESEND, calculate_checksum
+from common import (
+    SENSOR_SPECS, validate_sensor_data, validate_ip, validate_port,
+    log_event, set_console_logging
+)
+from protocol import (
+    REGISTER, REGISTER_ACK, DATA, ACK, RESEND, KEEPALIVE, KEEPALIVE_ACK, REJECT,
+    decode_message, encode_message, calculate_checksum,
+    TOKEN_MIN, TOKEN_MAX, IDLE_TIMEOUT, KEEPALIVE_INTERVAL
+)
+
+
+def send_message(sock, address, message):
+    sock.sendto(encode_message(message), address)
+    log_event("SERVER", f"Sent to {address}: {json.dumps(message)}", "MESSAGE")
+
+
+def check_sessions(sock, sessions):
+    now = time.monotonic()
+
+    for sensor_id, session in list(sessions.items()):
+        if now < session["next_keepalive_at"]:
+            continue
+
+        sensor_name = f"{session['sensor_type']}:{sensor_id}"
+
+        if not session["idle"]:
+            session["idle"] = True
+            log_event("SERVER", f"SENSOR IDLE: {sensor_name}")
+
+        if session["keepalive_attempts"] >= 3:
+            del sessions[sensor_id]
+            log_event("SERVER", f"SENSOR DISCONNECTED: {sensor_name}")
+            continue
+
+        message = {
+            "type": KEEPALIVE,
+            "sensor_id": sensor_id,
+            "message_id": session["next_keepalive_id"],
+            "token": session["token"]
+        }
+
+        session["pending_keepalive_id"] = message["message_id"]
+        session["next_keepalive_id"] += 1
+        session["keepalive_attempts"] += 1
+        session["next_keepalive_at"] += KEEPALIVE_INTERVAL
+
+        try:
+            send_message(sock, session["address"], message)
+        except OSError as error:
+            log_event("SERVER", f"KEEPALIVE send failed for {sensor_name}: {error}", level=logging.ERROR)
 
 
 def run_server(server_socket, stop_event):
     sessions = {}
+    used_tokens = set()
 
     while not stop_event.is_set():
+        check_sessions(server_socket, sessions)
+
         try:
             raw_data, sender_address = server_socket.recvfrom(65535)
         except socket.timeout:
             continue
         except OSError as error:
             log_event("SERVER", f"Socket error: {error}", level=logging.ERROR)
-            stop_event.set()
-            return
+            stop_event.wait(0.05)
+            continue
 
         try:
             message = decode_message(raw_data)
@@ -28,22 +80,68 @@ def run_server(server_socket, stop_event):
             continue
 
         log_event("SERVER", f"Received from {sender_address}: {json.dumps(message)}", "MESSAGE")
+
         try:
-            if handlers.get(message["type"]) is None:
+            if message["type"] == REGISTER:
+                answer = handle_register(message, sessions, sender_address, used_tokens)
+            elif message["type"] == DATA:
+                answer = handle_data(message, sessions, sender_address)
+            elif message["type"] == KEEPALIVE_ACK:
+                handle_keepalive_ack(message, sessions, sender_address)
+                continue
+            else:
                 raise ValueError("Invalid request type")
 
-            answer = handlers[message["type"]](message, sessions, sender_address)
-            encoded_answer = encode_message(answer)
-            server_socket.sendto(encoded_answer, sender_address)
-            log_event("SERVER", f"Sent to {sender_address}: {json.dumps(answer)}", "MESSAGE")
-        except (ValueError, OSError) as error:
-            log_event("SERVER", f"Cannot process message from {sender_address}: {error}", level=logging.ERROR)
+            send_message(server_socket, sender_address, answer)
+
+        except ValueError as error:
+            log_event("SERVER", f"Rejected message from {sender_address}: {error}", level=logging.WARNING)
+
+            if message["type"] in (REGISTER, DATA):
+                answer = {
+                    "type": REJECT,
+                    "message_id": message["message_id"],
+                    "reason": str(error)
+                }
+
+                try:
+                    send_message(server_socket, sender_address, answer)
+                except OSError as send_error:
+                    log_event("SERVER", f"Socket error: {send_error}", level=logging.ERROR)
+
+        except OSError as error:
+            log_event("SERVER", f"Socket error: {error}", level=logging.ERROR)
+
+
+def get_session(message, sessions, sender_address):
+    session = sessions.get(message["sensor_id"])
+
+    if session is None:
+        raise ValueError("Session with this sensor does not exist")
+
+    if session["token"] != message["token"]:
+        raise ValueError("Invalid token for current session")
+
+    if session["address"] != sender_address:
+        raise ValueError("Invalid sensor address")
+
+    return session
+
+
+def handle_keepalive_ack(message, sessions, sender_address):
+    session = get_session(message, sessions, sender_address)
+
+    if message["message_id"] != session["pending_keepalive_id"]:
+        raise ValueError("Unexpected KEEPALIVE_ACK message id")
+
+    session["keepalive_attempts"] = 0
+    session["pending_keepalive_id"] = None
 
 
 def main(host: str, port: int):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
         server_socket.bind((host, port))
-        server_socket.settimeout(0.2)
+        server_socket.settimeout(0.05)
         log_event("SERVER", f"Server listening on {host}:{port}")
 
         stop_event = threading.Event()
@@ -68,24 +166,37 @@ def main(host: str, port: int):
             log_event("SERVER", "Server stopped")
 
 
-def handle_register(message: dict, sessions: dict, sender_address: tuple):
-    if not message["sensor_type"] in SENSOR_SPECS.keys():
+def handle_register(message: dict, sessions: dict, sender_address: tuple, used_tokens: set):
+    if message["sensor_type"] not in SENSOR_SPECS:
         raise ValueError("Invalid sensor type")
 
     if message["sensor_id"].strip() == "":
         raise ValueError("Invalid sensor id")
 
-    if message["sensor_id"] in sessions.keys():
+    if message["sensor_id"] in sessions:
         raise ValueError("Sensor with this id already registered")
 
+    if len(used_tokens) >= TOKEN_MAX:
+        raise ValueError("No unused tokens available; restart the server")
+
     sensor_token = random.randint(TOKEN_MIN, TOKEN_MAX)
-    while sensor_token in [tester["token"] for tester in sessions.values()]:
+
+    while sensor_token in used_tokens:
         sensor_token = random.randint(TOKEN_MIN, TOKEN_MAX)
+
+    used_tokens.add(sensor_token)
+    now = time.monotonic()
 
     sessions[message["sensor_id"]] = {
         "sensor_type": message["sensor_type"],
         "token": sensor_token,
-        "tester_addres": sender_address
+        "address": sender_address,
+        "last_data_at": now,
+        "idle": False,
+        "next_keepalive_at": now + IDLE_TIMEOUT,
+        "keepalive_attempts": 0,
+        "next_keepalive_id": 1,
+        "pending_keepalive_id": None
     }
 
     log_event("SERVER", f"Sensor registered: {message['sensor_type']}:{message['sensor_id']}")
@@ -102,12 +213,7 @@ def handle_register_ack(message_id: int, token: int):
 
 
 def handle_data(message: dict, sessions: dict, sender_address: tuple):
-    if sessions.get(message["sensor_id"]) is None:
-        raise ValueError("Session with this sensor does not exist")
-
-    session = sessions[message["sensor_id"]]
-    if session["token"] != message["token"]:
-        raise ValueError("Invalid token for current session")
+    session = get_session(message, sessions, sender_address)
 
     sensor_name = f"{session['sensor_type']}:{message['sensor_id']}"
 
@@ -125,6 +231,13 @@ def handle_data(message: dict, sessions: dict, sender_address: tuple):
         }
 
     validate_sensor_data(session["sensor_type"], message["data"])
+
+    session["last_data_at"] = time.monotonic()
+    session["next_keepalive_at"] = session["last_data_at"] + IDLE_TIMEOUT
+    session["idle"] = False
+    session["keepalive_attempts"] = 0
+    session["pending_keepalive_id"] = None
+
     log_event("SERVER", f"Measurement accepted: {sensor_name} {json.dumps(message['data'])}")
 
     return handle_ack(message["message_id"], message["token"])
@@ -139,27 +252,23 @@ def handle_ack(message_id: int, token: int):
     return message
 
 
-handlers = {
-    REGISTER: handle_register,
-    DATA: handle_data,
-}
-
-
-if __name__ == "__main__":
+def settings_menu():
     log_event("SERVER", "Server program started")
     host = "127.0.0.1"
     port = 25565
+    console_logging = False
 
     while True:
         print("SERVER")
         print(f"1. Set IP ({host})")
         print(f"2. Set port ({port})")
         print("3. Start listening")
+        print(f"4. Console logging: {'ON' if console_logging else 'OFF'}")
         print("0. Exit")
-        op = input(": ")
+        op = input(": ").strip()
         print("--------------------")
 
-        match (op):
+        match op:
             case "1":
                 try:
                     new_ip = input("Enter server IP: ").strip()
@@ -187,6 +296,10 @@ if __name__ == "__main__":
                     print(f"Socket error: {error}")
                     log_event("SERVER", f"Socket error: {error}", level=logging.ERROR)
 
+            case "4":
+                console_logging = not console_logging
+                set_console_logging("SERVER", console_logging)
+
             case "0":
                 break
 
@@ -195,4 +308,11 @@ if __name__ == "__main__":
 
         print("--------------------")
 
-    log_event("SERVER", "Server program closed")
+
+if __name__ == "__main__":
+    try:
+        settings_menu()
+    except (KeyboardInterrupt, EOFError):
+        print("\nServer closed")
+    finally:
+        log_event("SERVER", "Server program closed")

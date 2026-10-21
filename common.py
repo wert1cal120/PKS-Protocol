@@ -2,6 +2,7 @@ import ipaddress
 import random
 import logging
 import time
+import sys
 from pathlib import Path
 
 SENSOR_SPECS = {
@@ -90,11 +91,12 @@ SENSOR_SPECS = {
     }
 }
 
+
 def validate_sensor_data(sensor_type: str, data: dict) -> bool:
     if not isinstance(sensor_type, str):
         raise ValueError("Sensor type is not str")
 
-    if not sensor_type in SENSOR_SPECS.keys():
+    if sensor_type not in SENSOR_SPECS:
         raise ValueError("Invalid sensor type")
 
     sensor_format = SENSOR_SPECS[sensor_type]
@@ -106,7 +108,10 @@ def validate_sensor_data(sensor_type: str, data: dict) -> bool:
         raise ValueError("Invalid data dict")
 
     for key, value in data.items():
-        min_value, max_value, decimals = sensor_format[key].values()
+        spec = sensor_format[key]
+        min_value = spec["min"]
+        max_value = spec["max"]
+        decimals = spec["decimals"]
 
         if (decimals == 0 and type(value) != int) or (decimals > 0 and type(value) not in (int, float)):
             raise ValueError("Unexpected value type")
@@ -116,8 +121,9 @@ def validate_sensor_data(sensor_type: str, data: dict) -> bool:
 
     return True
 
+
 def generate_sensor_data(sensor_type: str):
-    if not sensor_type in SENSOR_SPECS.keys():
+    if sensor_type not in SENSOR_SPECS:
         raise ValueError("Invalid sensor_type")
 
     data = {}
@@ -125,11 +131,14 @@ def generate_sensor_data(sensor_type: str):
     sensor_type_format = SENSOR_SPECS[sensor_type]
 
     for key, value in sensor_type_format.items():
-        min_value, max_value, decimals = value.values()
+        min_value = value["min"]
+        max_value = value["max"]
+        decimals = value["decimals"]
         data[key] = round(random.uniform(min_value, max_value), decimals) if decimals != 0 else random.randint(min_value, max_value)
 
     validate_sensor_data(sensor_type, data)
     return data
+
 
 def validate_ip(ip: str) -> bool:
     if not isinstance(ip, str):
@@ -137,6 +146,7 @@ def validate_ip(ip: str) -> bool:
 
     ipaddress.IPv4Address(ip)
     return True
+
 
 def validate_port(port: int) -> bool:
     if type(port) is not int:
@@ -147,8 +157,8 @@ def validate_port(port: int) -> bool:
 
     return True
 
-def log_event(source: str, message: str, log_type: str = "SYSTEM", level: int = logging.INFO):
-    program = source.split(":")[0]
+
+def get_logger(program: str):
     logger = logging.getLogger(f"PKS.{program}")
 
     if not logger.handlers:
@@ -166,4 +176,26 @@ def log_event(source: str, message: str, log_type: str = "SYSTEM", level: int = 
         logger.setLevel(logging.INFO)
         logger.propagate = False
 
+    return logger
+
+
+def set_console_logging(program: str, enabled: bool):
+    logger = get_logger(program)
+
+    for handler in list(logger.handlers):
+        if type(handler) is logging.StreamHandler:
+            logger.removeHandler(handler)
+            handler.close()
+
+    if enabled:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logger.handlers[0].formatter)
+        logger.addHandler(handler)
+
+    state = "enabled" if enabled else "disabled"
+    log_event(program, f"Console logging {state}")
+
+
+def log_event(source: str, message: str, log_type: str = "SYSTEM", level: int = logging.INFO):
+    logger = get_logger(source.split(":")[0])
     logger.log(level, message, extra={"log_type": log_type, "source": source})
