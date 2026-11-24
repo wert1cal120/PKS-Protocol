@@ -199,7 +199,11 @@ def handle_command(sock, server_address, command, message_id, pending):
 
 def handle_answer(sock, server_address, sessions, pending, answer):
     if answer["type"] == KEEPALIVE:
-        session = next((item for item in sessions if item["sensor_id"] == answer["sensor_id"]), None)
+        session = None
+        for item in sessions:
+            if item["token"] == answer["token"]:
+                session = item
+                break
 
         if session is None or session["token"] is None:
             return
@@ -300,7 +304,10 @@ def run_sender(sock, server_address, sessions, message_id, commands, stop_event)
                 session = request["session"] if request is not None else None
 
                 if answer["type"] == KEEPALIVE:
-                    session = next((item for item in sessions if item["sensor_id"] == answer["sensor_id"]), None)
+                    for item in sessions:
+                        if item["token"] == answer["token"]:
+                            session = item
+                            break
 
                 source = f"TESTER:{session['sensor_type']}:{session['sensor_id']}" if session else "TESTER"
                 log_event(source, f"Received from {sender_address}: {json.dumps(answer)}", "MESSAGE")

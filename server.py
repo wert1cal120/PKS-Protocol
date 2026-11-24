@@ -114,17 +114,24 @@ def run_server(server_socket, stop_event):
 
 
 def get_session(message, sessions, sender_address):
-    session = sessions.get(message["sensor_id"])
+    sensor_id = None
+    session = None
+    for current_id, current_session in sessions.items():
+        if current_session["token"] == message.get("token"):
+            sensor_id = current_id
+            session = current_session
+            break
 
     if session is None:
         raise ValueError("Session with this sensor does not exist")
 
-    if session["token"] != message["token"]:
-        raise ValueError("Invalid token for current session")
+    if "sensor_id" in message and message["sensor_id"] != sensor_id:
+        raise ValueError("Invalid sensor id for current session")
 
     if session["address"] != sender_address:
         raise ValueError("Invalid sensor address")
 
+    message["sensor_id"] = sensor_id
     return session
 
 
