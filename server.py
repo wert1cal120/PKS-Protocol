@@ -57,12 +57,12 @@ def check_sessions(sock, sessions):
             log_event("SERVER", f"KEEPALIVE send failed for {sensor_name}: {error}", level=logging.ERROR)
 
 
-def run_server(server_socket, stop_event):
-    sessions = {}
+def run_server(server_socket, stop_event, sessions, sessions_lock):
     used_tokens = set()
 
     while not stop_event.is_set():
-        check_sessions(server_socket, sessions)
+        with sessions_lock:
+            check_sessions(server_socket, sessions)
 
         try:
             raw_data, sender_address = server_socket.recvfrom(65535)
@@ -82,17 +82,19 @@ def run_server(server_socket, stop_event):
         log_event("SERVER", f"Received from {sender_address}: {json.dumps(message)}", "MESSAGE")
 
         try:
-            if message["type"] == REGISTER:
-                answer = handle_register(message, sessions, sender_address, used_tokens)
-            elif message["type"] == DATA:
-                answer = handle_data(message, sessions, sender_address)
-            elif message["type"] == KEEPALIVE_ACK:
-                handle_keepalive_ack(message, sessions, sender_address)
-                continue
-            else:
-                raise ValueError("Invalid request type")
+            with sessions_lock:
+                if message["type"] == REGISTER:
+                    answer = handle_register(message, sessions, sender_address, used_tokens)
+                elif message["type"] == DATA:
+                    answer = handle_data(message, sessions, sender_address)
+                elif message["type"] == KEEPALIVE_ACK:
+                    handle_keepalive_ack(message, sessions, sender_address)
+                    continue
+                else:
+                    raise ValueError("Invalid request type")
 
-            send_message(server_socket, sender_address, answer)
+            if answer:
+                send_message(server_socket, sender_address, answer)
 
         except ValueError as error:
             log_event("SERVER", f"Rejected message from {sender_address}: {error}", level=logging.WARNING)
@@ -151,20 +153,66 @@ def main(host: str, port: int):
         server_socket.settimeout(0.05)
         log_event("SERVER", f"Server listening on {host}:{port}")
 
+        sessions = {}
+        sessions_lock = threading.Lock()
         stop_event = threading.Event()
-        receiver = threading.Thread(target=run_server, args=(server_socket, stop_event))
+        receiver = threading.Thread(
+            target=run_server,
+            args=(server_socket, stop_event, sessions, sessions_lock)
+        )
         receiver.start()
 
         try:
             while not stop_event.is_set():
                 print(f"SERVER - listening on {host}:{port}")
+                print("1. Configure how many DATA ACKs to skip")
                 print("0. Stop listening and return to settings")
                 op = input(": ").strip()
 
                 if op == "0":
                     break
 
-                print("Invalid option")
+                if op != "1":
+                    print("Invalid option")
+                    continue
+
+                with sessions_lock:
+                    registered = [
+                        (sensor_id, session["sensor_type"], session["skip_next_message"])
+                        for sensor_id, session in sessions.items()
+                    ]
+
+                if not registered:
+                    print("No registered sensors")
+                    continue
+
+                print("Registered sensors:")
+                for index, (sensor_id, sensor_type, remaining) in enumerate(registered, 1):
+                    print(f"{index}. {sensor_type} ({sensor_id}) - ACK skips remaining: {remaining}")
+
+                try:
+                    choice = int(input("Choose sensor (0 to cancel): ").strip())
+                    if choice == 0:
+                        continue
+                    if not 1 <= choice <= len(registered):
+                        raise ValueError("Invalid sensor number")
+
+                    skip_count = int(input("How many upcoming valid DATA packets should receive no ACK? ").strip())
+                    if skip_count < 0:
+                        raise ValueError("The number of skipped ACKs cannot be negative")
+                except ValueError as error:
+                    print(f"Invalid selection: {error}")
+                    continue
+
+                sensor_id, sensor_type, _ = registered[choice - 1]
+                with sessions_lock:
+                    session = sessions.get(sensor_id)
+                    if session is None:
+                        print("That sensor is no longer registered")
+                        continue
+                    session["skip_next_message"] = skip_count
+
+                print(f"Will skip ACKs for the next {skip_count} valid DATA packets from {sensor_type} ({sensor_id})")
         except (KeyboardInterrupt, EOFError):
             pass
         finally:
@@ -203,7 +251,10 @@ def handle_register(message: dict, sessions: dict, sender_address: tuple, used_t
         "next_keepalive_at": now + IDLE_TIMEOUT,
         "keepalive_attempts": 0,
         "next_keepalive_id": 1,
-        "pending_keepalive_id": None
+        "pending_keepalive_id": None,
+        "skip_next_message": 0,
+        "last_message_id": None,
+        "last_crc": None
     }
 
     log_event("SERVER", f"Sensor registered: {message['sensor_type']}:{message['sensor_id']}")
@@ -239,13 +290,27 @@ def handle_data(message: dict, sessions: dict, sender_address: tuple):
 
     validate_sensor_data(session["sensor_type"], message["data"])
 
+    is_duplicate = session["last_message_id"] == message["message_id"]
+    if is_duplicate and session["last_crc"] != message["checksum"]:
+        raise ValueError("Message id reused with different DATA content")
+
     session["last_data_at"] = time.monotonic()
     session["next_keepalive_at"] = session["last_data_at"] + IDLE_TIMEOUT
     session["idle"] = False
     session["keepalive_attempts"] = 0
     session["pending_keepalive_id"] = None
 
-    log_event("SERVER", f"Measurement accepted: {sensor_name} {json.dumps(message['data'])}")
+    suppress_ack = session["skip_next_message"] > 0
+    if suppress_ack:
+        session["skip_next_message"] -= 1
+
+    if not is_duplicate:
+        session["last_message_id"] = message["message_id"]
+        session["last_crc"] = message["checksum"]
+        log_event("SERVER", f"Measurement accepted: {sensor_name} {json.dumps(message['data'])}")
+
+    if suppress_ack:
+        return None
 
     return handle_ack(message["message_id"], message["token"])
 

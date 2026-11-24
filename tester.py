@@ -275,7 +275,7 @@ def handle_answer(sock, server_address, sessions, pending, answer):
     request["sent_at"] = time.monotonic()
 
 
-def check_timeouts(sessions, pending):
+def check_timeouts(sock, server_address, sessions, pending):
     now = time.monotonic()
 
     for session in sessions:
@@ -283,7 +283,29 @@ def check_timeouts(sessions, pending):
             disconnect_sensor(session, pending, "No server response for 30 seconds")
 
     for message_id, request in list(pending.items()):
-        if now - request["sent_at"] >= REPLY_TIMEOUT:
+        if now - request["sent_at"] < REPLY_TIMEOUT:
+            continue
+
+        message = request["message"]
+        if message["type"] == DATA and request["attempts"] < 3:
+            session = request["session"]
+            source = f"TESTER:{session['sensor_type']}:{session['sensor_id']}"
+
+            try:
+                sock.sendto(encode_message(message), server_address)
+            except OSError as error:
+                finish_request(pending, message_id, f"Failed to resend DATA: {error}")
+                continue
+
+            log_event(source, f"Sent to {server_address}: {json.dumps(message)}", "MESSAGE")
+            log_event(source, f"Resending DATA after timeout: {message_id}")
+            request["attempts"] += 1
+            request["sent_at"] = time.monotonic()
+            continue
+
+        if message["type"] == DATA:
+            finish_request(pending, message_id, "No ACK after 3 DATA attempts")
+        else:
             finish_request(pending, message_id, "No response within 3 seconds")
 
 
@@ -318,7 +340,7 @@ def run_sender(sock, server_address, sessions, message_id, commands, stop_event)
             except (ValueError, OSError) as error:
                 log_event("TESTER", f"Receive error: {error}", level=logging.WARNING)
 
-            check_timeouts(sessions, pending)
+            check_timeouts(sock, server_address, sessions, pending)
 
             try:
                 command = commands.get_nowait()
