@@ -38,7 +38,6 @@ MESSAGE_FORMATS = {
     REJECT: {"type": str, "message_id": int, "reason": str},
 }
 
-# The program uses sensor_id locally for logging. It is not sent in these packets.
 OPTIONAL_LOCAL_FIELDS = {
     DATA: {"sensor_id": str},
     KEEPALIVE: {"sensor_id": str},
@@ -258,7 +257,7 @@ def decode_message(packet):
             "checksum": int.from_bytes(packet[-2:], "big"),
         }
 
-    else:  # REJECT
+    else:
         if len(packet) != 4 or packet[3] not in REJECT_REASONS:
             raise ValueError("Invalid REJECT message")
         message = {
