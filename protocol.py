@@ -152,7 +152,6 @@ def _unpack_data(sensor_type, payload):
 
 
 def calculate_checksum(message):
-    """Return CRC-16/CCITT-FALSE for the DATA bytes before the CRC field."""
     if not isinstance(message, dict) or message.get("type") != DATA:
         raise ValueError("CRC can only be calculated for DATA")
 
